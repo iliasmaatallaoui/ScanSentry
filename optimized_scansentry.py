@@ -4,30 +4,34 @@ import threading
 import time
 import pyautogui
 import pytesseract
-from PIL import ImageGrab, ImageOps
+from PIL import ImageGrab, ImageOps, Image
+import numpy as np
 from plyer import notification
-from multiprocessing import Process, set_start_method
+from multiprocessing import Process, set_start_method, Queue, Value
 import keyboard
 import sys
 import os
 import argparse
+import cv2
+import mss
+import re
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='Screen Watcher Application')
 parser.add_argument('--headless', '-H', action='store_true', help='Run in headless mode without GUI')
 parser.add_argument('--config', '-c', help='Path to configuration file')
+parser.add_argument('--interval', '-i', type=float, default=0.1, help='Scanning interval in seconds (default: 0.1)')
+parser.add_argument('--debug', '-d', action='store_true', help='Enable debug mode with additional logging')
 args = parser.parse_args()
 
 # Set Tesseract path (Windows)
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 # Constants
-TARGET_WORDS = ["Troublemaker", "Sssssss"]
-OCR_CONFIG = "--psm 6"
+TARGET_WORDS = ["AT", "S"]
+OCR_CONFIG = "--psm 6 --oem 1"  # Use LSTM OCR engine for better speed/accuracy balance
 
 # Global variables
-scan_count_var = None
-scan_interval=0.1
 region_points = {}
 scanning = False
 scanner_thread = None
@@ -35,12 +39,23 @@ overlay_active = False
 overlay_process = None
 is_headless = args.headless
 config_file = args.config
-reverse_logic_var = None 
+scan_interval = args.interval
+debug_mode = args.debug
+status_display = None  # Will be set in GUI mode
+last_ocr_result = ""  # Cache last OCR result
+ocr_cache = {}  # Simple image hash -> text cache
+# We'll create mss instance per thread instead of globally
 
 # Function to log in both GUI and headless modes
-def log(msg):
+def log(msg, level="INFO"):
+    if level == "DEBUG" and not debug_mode:
+        return
+        
     print(f"{time.strftime('%H:%M:%S')} - {msg}")
-    if not is_headless and 'status_display' in globals() and status_display:
+    if not is_headless and status_display:
+        # Limit log lines to prevent UI slowdown
+        #if status_display.index('end-1c').split('.')[0] > '1000':
+         #   status_display.delete('1.0', '500.0')
         status_display.insert(tk.END, f"{time.strftime('%H:%M:%S')} - {msg}\n")
         status_display.see(tk.END)
 
@@ -51,12 +66,32 @@ def show_notification(title, message):
         log(f"Notification error: {str(e)}")
 
 def preprocess_image(image):
+    """Faster image preprocessing using numpy and cv2"""
     try:
-        gray = ImageOps.grayscale(image)
-        return gray.point(lambda x: 0 if x < 160 else 255, '1')
+        # Convert PIL image to numpy array if needed
+        if isinstance(image, Image.Image):
+            image = np.array(image)
+            
+        # Convert to grayscale if needed
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image
+            
+        # Apply adaptive thresholding for better text detection
+        thresh = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY, 11, 2
+        )
+        
+        # Convert back to PIL for tesseract compatibility
+        return Image.fromarray(thresh)
     except Exception as e:
         log(f"Image processing error: {str(e)}")
-        return image  # Return original image as fallback
+        # Return original image as fallback
+        if isinstance(image, np.ndarray):
+            return Image.fromarray(image)
+        return image
 
 def region_defined():
     return ('top_left' in region_points and 
@@ -64,43 +99,62 @@ def region_defined():
             region_points['top_left'] is not None and 
             region_points['bottom_right'] is not None)
 
-def check_screen_and_act(region):
+def compute_image_hash(image):
+    """Create a simple perceptual hash for the image to use as cache key"""
+    img = image.resize((8, 8), Image.LANCZOS).convert('L')
+    pixels = np.array(img.getdata()).reshape((8, 8))
+    return hash(pixels.tobytes())
+
+def check_screen_and_act(region, sct):
+    global last_ocr_result
+    
     try:
-        screenshot = ImageGrab.grab(bbox=region)
-        processed = preprocess_image(screenshot)
-        text = pytesseract.image_to_string(processed, config=OCR_CONFIG)
-        log(f"[+] OCR Result: {text.strip()}")
+        # Using mss for faster screenshots - with per-thread instance
+        monitor = {"top": region[1], "left": region[0], 
+                   "width": region[2] - region[0], "height": region[3] - region[1]}
+        
+        screenshot = Image.frombytes('RGB', (monitor["width"], monitor["height"]), 
+                                    sct.grab(monitor).rgb)
+        
+        # Check if the image is very similar to previous one to avoid re-processing
+        img_hash = compute_image_hash(screenshot)
+        
+        if img_hash in ocr_cache:
+            text = ocr_cache[img_hash]
+            log("Using cached OCR result", "DEBUG")
+        else:
+            processed = preprocess_image(screenshot)
+            text = pytesseract.image_to_string(processed, config=OCR_CONFIG)
+            
+            # Keep cache size limited
+            if len(ocr_cache) > 50:
+                ocr_cache.clear()
+            ocr_cache[img_hash] = text
+        
+        # Only log if text changed to reduce console spam
+        if text.strip() != last_ocr_result.strip():
+            log(f"[+] OCR Result: {text.strip()}", "DEBUG")
+            last_ocr_result = text.strip()
 
         found_any = False
         for word in TARGET_WORDS:
-            if word.lower() in text.lower():
+            # Use regex for more flexible matching
+            if re.search(r'\b' + re.escape(word) + r'\b', text, re.IGNORECASE):
                 found_any = True
+                log(f"[+] Found '{word}' → pressing G")
+                pyautogui.press('g')
+                #show_notification("Detected", f"Found '{word}'")
                 break
 
-        # Determine if reverse logic is enabled
-        reverse = False
-        if reverse_logic_var is not None:
-            # GUI mode
-            reverse = reverse_logic_var.get()
-        elif hasattr(sys, 'reverse_logic') and sys.reverse_logic:
-            # Headless mode 
-            reverse = True
-
-        if reverse:
-            if not found_any:
-                pyautogui.press('g')
-                log("[Reverse] No target words found → pressing G")
-            else:
-                log("[Reverse] Target word found, no action.")
-        else:
-            if found_any:
-                pyautogui.press('g')
-                log("[+] Found target word → pressing G")
-            else:
-                log("[-] No target words found.")
+        if debug_mode and not found_any:
+            log(f"[+] Found '{word}'")
+            #log("[-] No target words found.", "DEBUG")
+            
         pyautogui.press('down')
+        return True
     except Exception as e:
         log(f"Error in screen check: {str(e)}")
+        return False
 
 def set_point(corner, wait=3):    
     global overlay_active
@@ -174,33 +228,46 @@ def start_scanning():
         region_points['bottom_right'][1]
     )
     
-    # Get scan limit from GUI if available
-    scan_limit = 0
-    if scan_count_var is not None:
-        try:
-            scan_limit = int(scan_count_var.get())
-        except Exception:
-            scan_limit = 0  # Default to infinite if invalid
-
-    log(f"Scanning region {region} for '{TARGET_WORDS}' (limit: {scan_limit if scan_limit else 'infinite'})")
+    log(f"Scanning region {region} for '{TARGET_WORDS}'")
     show_notification("Started", "Scanning started.")
 
     scanning = True  # Set flag before starting thread
 
     def loop():
-        count = 0
-        while scanning:
-            try:
-                check_screen_and_act(region)
-                count += 1
-                if scan_limit > 0 and count >= scan_limit:
-                    log(f"Scan limit reached ({scan_limit}). Stopping scan.")
-                    stop_scanning()
-                    break
-                time.sleep(scan_interval)
-            except Exception as e:
-                log(f"Error in scanner thread: {str(e)}")
-                time.sleep(1)  # Slow down on errors
+        # Track performance metrics
+        scan_count = 0
+        start_time = time.time()
+        error_count = 0
+        
+        # Create a fresh mss instance in this thread
+        with mss.mss() as sct:
+            log("Created screenshot capture instance")
+            
+            while scanning:
+                try:
+                    success = check_screen_and_act(region, sct)
+                    scan_count += 1
+                    
+                    # Calculate and log performance every 100 scans
+                    if scan_count % 100 == 0:
+                        elapsed = time.time() - start_time
+                        scans_per_sec = scan_count / elapsed
+                        log(f"Performance: {scans_per_sec:.2f} scans/sec, errors: {error_count}", "DEBUG")
+                    
+                    # Use dynamic sleep interval based on system load
+                    if error_count > 5:
+                        # Back off if having errors
+                        time.sleep(scan_interval * 2)
+                    else:
+                        time.sleep(scan_interval)
+                        
+                    if not success:
+                        error_count += 1
+                        
+                except Exception as e:
+                    error_count += 1
+                    log(f"Error in scanner thread: {str(e)}")
+                    time.sleep(scan_interval * 2)  # Slow down on errors
 
     scanner_thread = threading.Thread(target=loop, daemon=True)
     scanner_thread.start()
@@ -222,11 +289,11 @@ def stop_scanning():
         log("Overlay deactivated.")
 
 # ---------- Overlay Logic ----------
-def run_overlay(x1, y1, x2, y2):
+def run_overlay(x1, y1, x2, y2, active_flag):
     try:
         from PyQt5.QtWidgets import QApplication, QWidget
         from PyQt5.QtGui import QPainter, QColor, QPen
-        from PyQt5.QtCore import Qt, QRect
+        from PyQt5.QtCore import Qt, QRect, QTimer
         
         # Ensure proper coordinates
         x1, x2 = min(x1, x2), max(x1, x2)
@@ -239,8 +306,18 @@ def run_overlay(x1, y1, x2, y2):
                 self.setAttribute(Qt.WA_TranslucentBackground)
                 self.setGeometry(rect)
                 self.rect = QRect(0, 0, rect.width(), rect.height())
+                
+                # Use timer to reduce CPU usage
+                self.update_timer = QTimer()
+                self.update_timer.timeout.connect(self.check_active)
+                self.update_timer.start(500)  # Check every 500ms
+                
                 self.show()
-
+                
+            def check_active(self):
+                if not active_flag.value:
+                    QApplication.quit()
+                
             def paintEvent(self, event):
                 painter = QPainter(self)
                 pen = QPen(QColor(255, 0, 0), 4)  # Red outline for visibility
@@ -278,7 +355,9 @@ def show_overlay_rect():
     x2, y2 = region_points['bottom_right']
 
     try:
-        overlay_process = Process(target=run_overlay, args=(x1, y1, x2, y2))
+        # Use shared memory to signal process termination
+        active_flag = Value('b', True)
+        overlay_process = Process(target=run_overlay, args=(x1, y1, x2, y2, active_flag))
         overlay_process.daemon = True
         overlay_process.start()
         overlay_active = True
@@ -329,15 +408,14 @@ def save_config():
             if 'bottom_right' in region_points:
                 f.write(f"bottom_right={region_points['bottom_right'][0]},{region_points['bottom_right'][1]}\n")
             f.write(f"target_words={','.join(TARGET_WORDS)}\n")
-            if reverse_logic_var is not None:
-                f.write(f"reverse_logic={int(reverse_logic_var.get())}\n")
+            f.write(f"scan_interval={scan_interval}\n")
         log(f"Configuration saved to {config_file}")
     except Exception as e:
         log(f"Error saving configuration: {str(e)}")
 
 def load_config():
     """Load configuration from file"""
-    global TARGET_WORDS, region_points
+    global TARGET_WORDS, region_points, scan_interval
     
     if not config_file or not os.path.exists(config_file):
         log("No config file found. Using default settings.")
@@ -367,19 +445,11 @@ def load_config():
                 elif key == 'target_words':
                     TARGET_WORDS = value.split(',')
                     log(f"Loaded target words: {TARGET_WORDS}")
-
-                elif key == 'reverse_logic':
-                    if reverse_logic_var is not None:
-                        reverse_logic_var.set(bool(int(value)))
-                    else:
-                        # For headless mode, set an attribute on sys
-                        setattr(sys, 'reverse_logic', bool(int(value)))
-                    log(f"Loaded reverse logic: {bool(int(value))}")
-
+                    
                 elif key == 'scan_interval':
-                    scan_interval = value
+                    scan_interval = float(value)
                     log(f"Loaded scan interval: {scan_interval}")
-
+        
         log(f"Configuration loaded from {config_file}")
     except Exception as e:
         log(f"Error loading configuration: {str(e)}")
@@ -429,12 +499,12 @@ def setup_hotkeys():
 
 # ---------- GUI Setup ----------
 def setup_gui():
-    global root, status_display, region_status, scanner_status, scan_count_var, reverse_logic_var
+    global root, status_display, region_status, scanner_status
     
     # Initialize GUI
     root = tk.Tk()
     root.title("Screen Watcher")
-    root.geometry("300x400")
+    root.geometry("400x500")
     root.attributes("-topmost", True)
 
     # Grid config for responsiveness
@@ -467,24 +537,44 @@ def setup_gui():
     # Fourth row (config)
     tk.Button(button_frame, text="Save Config", command=save_config).grid(row=3, column=0, padx=5, pady=2, sticky="ew")
     tk.Button(button_frame, text="Load Config", command=lambda: [load_config(), update_status()]).grid(row=3, column=1, padx=5, pady=2, sticky="ew")
-        
-    # Fifth row (scan count input, centered)
-    tk.Label(button_frame, text="Scan Limit:").grid(row=4, column=0, sticky="e", padx=5, pady=2)
-    scan_count_var = tk.StringVar(value="0")
-    scan_count_entry = tk.Entry(button_frame, textvariable=scan_count_var, width=6)
-    scan_count_entry.grid(row=4, column=1, sticky="w", padx=5, pady=2)
-    #tk.Label(button_frame, text="(0 = infinite)").grid(row=5, column=0, columnspan=2, sticky="n", pady=(0, 0))
 
-    # Sixth row (reverse logic checkbox)
-    reverse_logic_var = tk.BooleanVar(value=False)
-    tk.Checkbutton(button_frame, text="Reverse Logic", variable=reverse_logic_var).grid(
-        row=6, column=0, columnspan=2, pady=(2, 0), sticky="n"
-    )
-
+    # Settings frame
+    settings_frame = tk.Frame(root)
+    settings_frame.grid(row=4, column=0, padx=10, pady=5, sticky="ew")
+    settings_frame.columnconfigure(1, weight=1)
+    
+    # Scan interval setting
+    tk.Label(settings_frame, text="Scan Interval:").grid(row=0, column=0, sticky="w", padx=5)
+    interval_var = tk.StringVar(value=str(scan_interval))
+    interval_entry = tk.Entry(settings_frame, textvariable=interval_var, width=8)
+    interval_entry.grid(row=0, column=1, sticky="w", padx=5)
+    tk.Label(settings_frame, text="seconds").grid(row=0, column=2, sticky="w")
+    
+    def update_interval():
+        global scan_interval
+        try:
+            new_interval = float(interval_var.get())
+            if new_interval >= 0.01:
+                scan_interval = new_interval
+                log(f"Scan interval updated to {scan_interval}")
+            else:
+                log("Interval must be at least 0.01")
+                interval_var.set(str(scan_interval))
+        except ValueError:
+            log("Invalid interval value")
+            interval_var.set(str(scan_interval))
+    
+    tk.Button(settings_frame, text="Update", command=update_interval).grid(row=0, column=3, padx=5)
+    
+    # Debug mode checkbox
+    debug_var = tk.BooleanVar(value=debug_mode)
+    debug_check = tk.Checkbutton(settings_frame, text="Debug Mode", variable=debug_var, 
+                                command=lambda: setattr(__main__, 'debug_mode', debug_var.get()))
+    debug_check.grid(row=1, column=0, columnspan=4, sticky="w", padx=5, pady=5)
 
     # Status indicators
     status_frame = tk.Frame(root)
-    status_frame.grid(row=4, column=0, padx=10, pady=5, sticky="ew")
+    status_frame.grid(row=5, column=0, padx=10, pady=5, sticky="ew")
     status_frame.columnconfigure((0, 1), weight=1)
 
     region_status = tk.Label(status_frame, text="Region: Not Set", fg="red")
@@ -513,8 +603,8 @@ def setup_gui():
         else:
             scanner_status.config(text="Scanner: Inactive", fg="red")
         
-        # Schedule next update
-        root.after(500, update_status)
+        # Schedule next update - less frequent updates to reduce resource usage
+        root.after(1000, update_status)
     
     # Start status update loop
     update_status()
@@ -541,6 +631,9 @@ def on_close():
 
 # ---------- Main Entry Point ----------
 if __name__ == "__main__":
+    # For module access in callbacks
+    import __main__
+    
     try:
         set_start_method("spawn")
     except RuntimeError:
