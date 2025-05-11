@@ -1,0 +1,6 @@
+pyautogui
+pytesseract
+Pillow
+plyer
+keyboard
+PyQt5
