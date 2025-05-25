@@ -13,7 +13,7 @@ import os
 import argparse
 
 # Parse command line arguments
-parser = argparse.ArgumentParser(description='Screen Watcher Application')
+parser = argparse.ArgumentParser(description='Scan Sentry Application')
 parser.add_argument('--headless', '-H', action='store_true', help='Run in headless mode without GUI')
 parser.add_argument('--config', '-c', help='Path to configuration file')
 args = parser.parse_args()
@@ -46,7 +46,7 @@ def log(msg):
 
 def show_notification(title, message):
     try:
-        notification.notify(title=title, message=message, app_name="Screen Watcher", timeout=3)
+        notification.notify(title=title, message=message, app_name="Scan Sentry", timeout=3)
     except Exception as e:
         log(f"Notification error: {str(e)}")
 
@@ -395,7 +395,7 @@ def run_headless():
     # Register global hotkeys
     setup_hotkeys()
     
-    show_notification("Screen Watcher", "Running in headless mode. Use hotkeys to control.")
+    show_notification("Scan Sentry", "Running in headless mode. Use hotkeys to control.")
     
     if region_defined():
         log("Region already defined from config. Ready to start scanning.")
@@ -433,7 +433,7 @@ def setup_gui():
     
     # Initialize GUI
     root = tk.Tk()
-    root.title("Screen Watcher")
+    root.title("Scan Sentry")
     root.geometry("300x400")
     root.attributes("-topmost", True)
 
@@ -446,7 +446,7 @@ def setup_gui():
     status_display.grid(row=2, column=0, padx=10, pady=5, sticky="nsew")
 
     # ---------- GUI Layout ----------
-    tk.Label(root, text="Screen Watcher", font=("Arial", 16, "bold")).grid(row=0, column=0, pady=5)
+    tk.Label(root, text="Scan Sentry", font=("Arial", 16, "bold")).grid(row=0, column=0, pady=5)
 
     button_frame = tk.Frame(root)
     button_frame.grid(row=1, column=0, padx=10, pady=2, sticky="ew")
