@@ -29,7 +29,7 @@ A lightweight Python utility that uses OCR (Optical Character Recognition) to mo
 
 1. Clone this repository:
 ```bash
-git clone https://github.com/username/ScanSentry.git
+git clone https://github.com/iliasmaatallaoui/ScanSentry.git
 cd ScanSentry
 ```
 
